@@ -1,4 +1,5 @@
 mod frame;
+mod tls;
 use frame::*;
 use futures::{SinkExt, StreamExt};
 //StreamExt → gives you .next()
