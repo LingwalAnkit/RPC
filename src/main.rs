@@ -1,59 +1,120 @@
 mod frame;
 mod tls;
+use std::error;
+
+use anyhow::{Ok, Result, anyhow, ensure};
+use bytes::Bytes;
 use frame::*;
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, channel::mpsc::Recv};
 //StreamExt → gives you .next()
 //SinkExt → gives you .send()
 // to send and receive frames
+use quinn::{Connection, ConnectionError, Endpoint, Incoming, RecvStream, SendStream};
+use rustls::{quic::Connection::Server, server};
 use tokio::net::{TcpListener, TcpStream}; // Incomming connection and TCP Stream
-use tokio_util::codec::Framed; // This Gives message/frame interface
+use tokio_util::codec::{Framed, FramedRead, FramedWrite}; // This Gives message/frame interface
 // bytes -> codec -> frames and back
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:7000").await?;
+async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 
-    tokio::spawn(async move {
-        // server task wiats for the client (main task)
-        let (socket, _) = listener.accept().await.unwrap(); // socket and client address
-        // socket is the tcp stream
-        let mut framed = Framed::new(socket, FrameCodec); // combine socket and codec socket understand bytes and framecodec understand both
-        while let Some(Ok(mut f)) = framed.next().await {
-            // server waits for incoming frames
-            f.kind = Kind::Response; // add response to request
-            framed.send(f).await.unwrap(); // send response back to client
-        } // decode and encode frames with responses
-    });
+    let ca = tls::DevCA::new()?;
 
-    // These both are concurrent and the socket waits for the tcp stream to be established
+    // --- server ---
+    let server_cfg = ca.server_config(ca.issue("server.rpc")?)?;
+    let server_ep = Endpoint::server(server_cfg, "127.0.0.1:0".parse()?)?;
+    let addr = server_ep.local_addr()?;
+    tokio::spawn(serve(server_ep));
 
-    let mut client = Framed::new(TcpStream::connect("127.0.0.1:7000").await?, FrameCodec); // client as get this Framed<TcpStream, FrameCodec>
-    client
-        .send(Frame {
-            kind: Kind::Request,
-            flags: END_STREAM,
-            call_id: 42,
-            payload: "hello".into(),
-        })
-        .await?;
-    // client sends a request
-    println!("{:?}", client.next().await.unwrap()?); // waits for a response
+    // --- client ---
+    let mut client_ep = Endpoint::client("0.0.0.0:0".parse()?)?;
+    client_ep.set_default_client_config(ca.client_config(ca.issue("client-1")?)?);
+    let conn = client_ep.connect(addr, "server.rpc")?.await?;
+
+    let resp = call(&conn, 1, b"hello over quic").await?;
+    println!("{:?}", resp);
+
+    conn.close(0u32.into(), b"done");
+    client_ep.wait_idle().await;
     Ok(())
 }
 
-// .send calls FrameCodec.encode() to convert the frame to bytes before sending
-// .next() calls FrameCodec.decode() to convert the bytes to a frame after receiving
+// server side
+async fn serve(ep: Endpoint) {
+    while let Some(incoming) = ep.accept().await {
+        tokio::spawn(async move {
+            match incoming.await {
+                Ok(conn) => {
+                    if let Err(e) = handle_conn(conn).await {
+                        eprintln!("connection error: {e}");
+                    }
+                }
+                Err(e) => eprintln!("handshake failed: {e}"),
+            }
+        });
+    }
+}
+async fn handle_conn(conn: Connection) -> Result<()> {
+    loop {
+        let (send, recv) = match conn.accept_bi().await {
+            Ok(s) => s,
+            Err(ConnectionError::ApplicationClosed(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = handle_stream(send, recv).await {
+                eprintln!("Stream error {}", e);
+            }
+        });
+    }
+}
 
-//CLIENT                              SERVER
+async fn handle_stream(send: SendStream, recv: RecvStream) -> Result<()> {
+    let mut rx = FramedRead::new(recv, FrameCodec);
+    let mut tx = FramedWrite::new(send, FrameCodec);
 
-// .send(Frame) ─────────────────────► .next()
-//                                        │
-//                                        │ receives Frame
-//                                        ▼
-//                                     modify Frame
-//                                     Request → Response
-//                                        │
-//                                        ▼
-//                                    .send(Frame)
-//         ◄──────────────────────────────┘
-// .next()
+    let req = rx
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("stream closed before request"))??;
+    ensure!(
+        req.kind == Kind::Request,
+        "expected Request, got {:?}",
+        req.kind
+    );
+
+    // Echo handler for now; real dispatch arrives with the IDL in Stage 4.
+    tx.send(Frame {
+        kind: Kind::Response,
+        flags: END_STREAM,
+        call_id: req.call_id,
+        payload: req.payload,
+    })
+    .await?;
+    tx.close().await?; // finishes the QUIC send stream
+    Ok(())
+}
+
+async fn call(conn: &Connection, call_id: u64, payload: &[u8]) -> Result<Frame> {
+    let (send, recv) = conn.open_bi().await?;
+
+    let mut tx = FramedWrite::new(send, FrameCodec);
+    tx.send(Frame {
+        kind: Kind::Request,
+        flags: END_STREAM,
+        call_id,
+        payload: Bytes::copy_from_slice(payload),
+    })
+    .await?;
+    tx.close().await?;
+
+    let mut rx = FramedRead::new(recv, FrameCodec);
+    let resp = rx
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("stream closed before response"))??;
+    Ok(resp)
+}
