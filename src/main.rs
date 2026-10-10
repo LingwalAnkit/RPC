@@ -1,18 +1,14 @@
 mod frame;
 mod tls;
-use std::error;
-
-use anyhow::{Ok, Result, anyhow, ensure};
+use anyhow::{Result, anyhow, ensure};
 use bytes::Bytes;
 use frame::*;
-use futures::{SinkExt, StreamExt, channel::mpsc::Recv};
+use futures::{SinkExt, StreamExt};
 //StreamExt → gives you .next()
 //SinkExt → gives you .send()
 // to send and receive frames
-use quinn::{Connection, ConnectionError, Endpoint, Incoming, RecvStream, SendStream};
-use rustls::{quic::Connection::Server, server};
-use tokio::net::{TcpListener, TcpStream}; // Incomming connection and TCP Stream
-use tokio_util::codec::{Framed, FramedRead, FramedWrite}; // This Gives message/frame interface
+use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream};
+use tokio_util::codec::{FramedRead, FramedWrite}; // This Gives message/frame interface
 // bytes -> codec -> frames and back
 
 #[tokio::main]
@@ -27,7 +23,7 @@ async fn main() -> Result<()> {
     let server_cfg = ca.server_config(ca.issue("server.rpc")?)?;
     let server_ep = Endpoint::server(server_cfg, "127.0.0.1:0".parse()?)?;
     let addr = server_ep.local_addr()?;
-    tokio::spawn(serve(server_ep));
+    tokio::spawn(serve(server_ep)); // run the server in bg
 
     // --- client ---
     let mut client_ep = Endpoint::client("0.0.0.0:0".parse()?)?;
@@ -35,7 +31,7 @@ async fn main() -> Result<()> {
     let conn = client_ep.connect(addr, "server.rpc")?.await?;
 
     let resp = call(&conn, 1, b"hello over quic").await?;
-    println!("{:?}", resp);
+    println!("{:?}", resp); // makes an rpc call
 
     conn.close(0u32.into(), b"done");
     client_ep.wait_idle().await;
@@ -108,8 +104,22 @@ async fn call(conn: &Connection, call_id: u64, payload: &[u8]) -> Result<Frame> 
         call_id,
         payload: Bytes::copy_from_slice(payload),
     })
+    // tx.send(frame)
+    // |
+    // v
+    // encode(item, dst)
+    // |
+    // | item = your Frame
+    // | dst  = output byte buffer
+    // v
+    // Serialized bytes in dst
+    // |
+    // v
+    // QUIC SendStream
     .await?;
-    tx.close().await?;
+    tx.close().await?; // client send request
+    // client send bytes framecode encode them
+    // server recieve
 
     let mut rx = FramedRead::new(recv, FrameCodec);
     let resp = rx
@@ -117,4 +127,7 @@ async fn call(conn: &Connection, call_id: u64, payload: &[u8]) -> Result<Frame> 
         .await
         .ok_or_else(|| anyhow!("stream closed before response"))??;
     Ok(resp)
+
+    // server send bytes
+    // framed code dencode them
 }
