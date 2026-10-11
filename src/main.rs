@@ -1,5 +1,7 @@
 mod frame;
+mod rpc;
 mod tls;
+
 use anyhow::{Result, anyhow, ensure};
 use bytes::Bytes;
 use frame::*;
