@@ -103,9 +103,12 @@ impl DevCA {
         // create ruslts config
         // start creatinf server ServerConfig::builder
         cfg.alpn_protocols = vec![ALPN.to_vec()]; // u8 -> vec and cfg.alpn_protocol takes vec<vec<u8>>
-        Ok(quinn::ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(cfg)?,
-        )))
+        let mut server =
+            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(cfg)?));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(1024u32.into());
+        server.transport_config(Arc::new(transport));
+        Ok(server)
         // quic quinn server
         // "Convert this rustls ServerConfig into a Quinn-compatible QUIC TLS configuration." -> QuicServerConfig and it has its own QUIC-compatible crypto configuration:
     }
