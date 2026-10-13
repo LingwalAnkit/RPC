@@ -228,3 +228,92 @@ async fn respond(
     let _ = send.stopped().await;
     Ok(())
 }
+
+// client
+
+#[derive(Clone)]
+pub struct Client {
+    conn: Connection,
+    next_id: Arc<AtomicU64>,
+}
+
+/// Owns both halves of a call's stream. If the call future is dropped before
+/// completing (timeout, abort), Drop tells the server to stop working.
+struct ActiveCall {
+    send: SendStream,
+    recv: RecvStream,
+    finished: bool,
+}
+
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.send.reset(CANCELLED);
+            let _ = self.recv.stop(CANCELLED);
+        }
+    }
+}
+
+impl Client {
+    pub fn new(conn: Connection) -> Self {
+        Self {
+            conn,
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub async fn call(&self, body: &[u8], timeout: Option<Duration>) -> Result<Bytes, RpcError> {
+        let call_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let deadline_ms = timeout
+            .map(|d| d.as_millis().clamp(1, u32::MAX as u128) as u32)
+            .unwrap_or(0);
+
+        let fut = self.call_inner(call_id, deadline_ms, body);
+        match timeout {
+            // On expiry the future is dropped, which triggers ActiveCall::drop.
+            Some(d) => tokio::time::timeout(d, fut).await.unwrap_or_else(|_| {
+                Err(RpcError::new(Code::DeadlineExceeded, "deadline exceeded"))
+            }),
+            None => fut.await,
+        }
+    }
+
+    async fn call_inner(
+        &self,
+        call_id: u64,
+        deadline_ms: u32,
+        body: &[u8],
+    ) -> Result<Bytes, RpcError> {
+        // Waits here if the server's stream limit is exhausted (backpressure).
+        let (send, recv) = self.conn.open_bi().await.map_err(unavailable)?;
+        let mut call = ActiveCall {
+            send,
+            recv,
+            finished: false,
+        };
+
+        let req = Frame {
+            kind: Kind::Request,
+            flags: END_STREAM,
+            call_id,
+            payload: encode_request(deadline_ms, body),
+        };
+        let mut buf = BytesMut::new();
+        FrameCodec.encode(req, &mut buf).map_err(internal)?;
+        call.send.write_all(&buf).await.map_err(unavailable)?;
+        call.send.finish().map_err(internal)?;
+
+        let resp = FramedRead::new(&mut call.recv, FrameCodec)
+            .next()
+            .await
+            .ok_or_else(|| unavailable("stream closed before response"))?
+            .map_err(internal)?;
+        call.finished = true;
+
+        match resp.kind {
+            Kind::Response => Ok(resp.payload),
+            Kind::Error => Err(RpcError::decode(resp.payload)),
+            other => Err(internal(format!("unexpected frame {other:?}"))),
+        }
+    }
+}
