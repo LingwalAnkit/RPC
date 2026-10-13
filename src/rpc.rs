@@ -1,34 +1,30 @@
-use anyhow::{Ok, anyhow};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::{StreamExt, future::MaybeDone::Future};
-use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use std::{
     future::Future,
-    io::ErrorKind::Other,
-    net::Shutdown,
-    process::Output,
-    result,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::{net::windows::named_pipe::PipeMode::Message, sync::watch::error};
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::StreamExt;
+use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use tokio_util::{
     codec::{Encoder, FramedRead},
     sync::CancellationToken,
     task::TaskTracker,
 };
 
-use crate::{frame::*, handle_stream};
+use crate::frame::*;
 
 const CANCELLED: VarInt = VarInt::from_u32(1);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+// ---------- errors ----------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-
 pub enum Code {
     Cancelled = 1,
     DeadlineExceeded = 2,
@@ -83,10 +79,11 @@ impl RpcError {
 fn unavailable(e: impl std::fmt::Display) -> RpcError {
     RpcError::new(Code::Unavailable, e.to_string())
 }
-
 fn internal(e: impl std::fmt::Display) -> RpcError {
     RpcError::new(Code::Internal, e.to_string())
 }
+
+// ---------- request payload ----------
 
 fn encode_request(deadline_ms: u32, body: &[u8]) -> Bytes {
     let mut b = BytesMut::with_capacity(4 + body.len());
@@ -97,11 +94,25 @@ fn encode_request(deadline_ms: u32, body: &[u8]) -> Bytes {
 
 fn decode_request(mut p: Bytes) -> Result<(u32, Bytes), RpcError> {
     if p.len() < 4 {
-        return Err(RpcError::new(Code::InvalidArgument, "Request too short"));
+        return Err(RpcError::new(Code::InvalidArgument, "request too short"));
     }
     let deadline_ms = p.get_u32();
     Ok((deadline_ms, p))
 }
+
+/// Demo handler: echoes the body. "sleep:<ms>" sleeps first (for testing deadlines).
+pub async fn echo(body: Bytes) -> Result<Bytes, RpcError> {
+    if let Some(ms) = body.strip_prefix(b"sleep:") {
+        let ms: u64 = std::str::from_utf8(ms)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| RpcError::new(Code::InvalidArgument, "bad sleep"))?;
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+    Ok(body)
+}
+
+// ---------- server ----------
 
 pub async fn serve<H, Fut>(ep: Endpoint, handler: H, shutdown: CancellationToken)
 where
@@ -145,22 +156,22 @@ async fn handle_conn<H, Fut>(
 {
     loop {
         let (send, recv) = tokio::select! {
-            _  = shutdown.cancelled() => return,
+            _ = shutdown.cancelled() => return,
             r = conn.accept_bi() => match r {
                 Ok(s) => s,
-                Err(_) => return,
+                Err(_) => return, // connection closed or lost
             },
         };
         let h = handler.clone();
         tracker.spawn(async move {
-            if let Err(e) = handel_stream(send, recv, h).await {
+            if let Err(e) = handle_stream(send, recv, h).await {
                 eprintln!("stream error: {e}");
             }
         });
     }
 }
 
-async fn handel_stream<H, Fut>(
+async fn handle_stream<H, Fut>(
     mut send: SendStream,
     recv: RecvStream,
     handler: Arc<H>,
@@ -206,8 +217,8 @@ where
 
 async fn respond(
     send: &mut SendStream,
-    result: Result<Bytes, RpcError>,
     call_id: u64,
+    result: Result<Bytes, RpcError>,
 ) -> anyhow::Result<()> {
     let (kind, payload) = match result {
         Ok(b) => (Kind::Response, b),
@@ -218,18 +229,20 @@ async fn respond(
         Frame {
             kind,
             flags: END_STREAM,
-            payload,
             call_id,
+            payload,
         },
         &mut buf,
     )?;
     send.write_all(&buf).await?;
     send.finish()?;
+    // finish() only queues the FIN. Wait until the peer ACKed it (or cancelled),
+    // otherwise a shutdown right after this could discard the response.
     let _ = send.stopped().await;
     Ok(())
 }
 
-// client
+// ---------- client ----------
 
 #[derive(Clone)]
 pub struct Client {
