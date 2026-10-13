@@ -277,6 +277,8 @@ impl Client {
 
     pub async fn call(&self, body: &[u8], timeout: Option<Duration>) -> Result<Bytes, RpcError> {
         let call_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // This line retrieves the current counter value and increments the counter atomically.
+
         let deadline_ms = timeout
             .map(|d| d.as_millis().clamp(1, u32::MAX as u128) as u32)
             .unwrap_or(0);
