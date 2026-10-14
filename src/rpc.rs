@@ -86,10 +86,11 @@ fn internal(e: impl std::fmt::Display) -> RpcError {
 // ---------- request payload ----------
 
 fn encode_request(deadline_ms: u32, body: &[u8]) -> Bytes {
-    let mut b = BytesMut::with_capacity(4 + body.len());
+    let mut b = BytesMut::with_capacity(4 + body.len()); // creates a mutable byte buffer with capacity for the four-byte deadline plus the body. Capacity is not necessarily the same as the buffer's current length.
+    // 4 bytes is deadline
     b.put_u32(deadline_ms);
-    b.extend_from_slice(body);
-    b.freeze()
+    b.extend_from_slice(body); // append the deadline in the buffer
+    b.freeze() // convert the buffer to bytes
 }
 
 fn decode_request(mut p: Bytes) -> Result<(u32, Bytes), RpcError> {
@@ -99,6 +100,8 @@ fn decode_request(mut p: Bytes) -> Result<(u32, Bytes), RpcError> {
     let deadline_ms = p.get_u32();
     Ok((deadline_ms, p))
 }
+
+// It reads the first four bytes as the deadline, leaving the remaining bytes as the body.
 
 /// Demo handler: echoes the body. "sleep:<ms>" sleeps first (for testing deadlines).
 pub async fn echo(body: Bytes) -> Result<Bytes, RpcError> {
@@ -272,16 +275,23 @@ impl Client {
         Self {
             conn,
             next_id: Arc::new(AtomicU64::new(1)),
+            // this creates a shared atomic counter initialized to 1
+            // AtomicU64 stores a 64-bit unsigned integer that can be updated safely across concurrent tasks.
         }
     }
 
     pub async fn call(&self, body: &[u8], timeout: Option<Duration>) -> Result<Bytes, RpcError> {
+        // &[u8] A borrowed slice of the request's bytes.
+        // timeout An optional timeout for the call. either contain some time or none
         let call_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         // This line retrieves the current counter value and increments the counter atomically.
 
         let deadline_ms = timeout
             .map(|d| d.as_millis().clamp(1, u32::MAX as u128) as u32)
-            .unwrap_or(0);
+            //  if timeout is Some(d) then convert duration to integer of millisec
+            .unwrap_or(0); // if the timeout was none then it become 0
+        // Clamp keep the value between 1 and max u32
+        // if option is non return 0
 
         let fut = self.call_inner(call_id, deadline_ms, body);
         match timeout {
@@ -289,6 +299,9 @@ impl Client {
             Some(d) => tokio::time::timeout(d, fut).await.unwrap_or_else(|_| {
                 Err(RpcError::new(Code::DeadlineExceeded, "deadline exceeded"))
             }),
+            // if timeout start waiting for the future if future finish in time tokio return Ok(value) if future returns a value else if error deadline exceeded
+            // fut -> result<Bytes , RpcError>
+            // Bytes is &u[8]
             None => fut.await,
         }
     }
@@ -301,6 +314,9 @@ impl Client {
     ) -> Result<Bytes, RpcError> {
         // Waits here if the server's stream limit is exhausted (backpressure).
         let (send, recv) = self.conn.open_bi().await.map_err(unavailable)?;
+        // open bi directional quic stream
+        // if connection stream limit has been reached map the error with rpc error unavailable
+
         let mut call = ActiveCall {
             send,
             recv,
@@ -311,19 +327,35 @@ impl Client {
             kind: Kind::Request,
             flags: END_STREAM,
             call_id,
-            payload: encode_request(deadline_ms, body),
+            payload: encode_request(deadline_ms, body), // appending the deadline with the body
         };
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::new(); // bytemut is a growable mutable byte buffer
+        // buf = []
+
         FrameCodec.encode(req, &mut buf).map_err(internal)?;
+        // encode serialze the req(frame) into bytes
+        // If the encoder returns an error, map_err(internal)
+        // we are using &mut buf Because encode() needs somewhere to put the encoded bytes, and &mut buf gives it permission to modify the buffer you created.
+
         call.send.write_all(&buf).await.map_err(unavailable)?;
+        //This writes the serialized frame bytes into the QUIC send stream.
+        // buf now contain the serealize frame
+
         call.send.finish().map_err(internal)?;
+        // Signals the end of the QUIC send stream.
 
         let resp = FramedRead::new(&mut call.recv, FrameCodec)
+            // call.recv source of incoming bytes
+            // framecodec decoder that know how to convert bytes to frame
+            // FramedRead bridges that gap: it reads the incoming byte stream and uses FrameCodec to decode complete frames.
             .next()
-            .await
+            .await // wait for the next frame
             .ok_or_else(|| unavailable("stream closed before response"))?
             .map_err(internal)?;
         call.finished = true;
+
+        // switch from sending to receiving
+        // Receiving the RPC response
 
         match resp.kind {
             Kind::Response => Ok(resp.payload),
