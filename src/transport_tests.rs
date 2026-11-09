@@ -212,7 +212,10 @@ async fn client_with_untrusted_certificate_is_rejected() -> anyhow::Result<()> {
     }
     .await;
 
-    assert!(outcome.is_err(), "server accepted a client certificate from an untrusted CA");
+    assert!(
+        outcome.is_err(),
+        "server accepted a client certificate from an untrusted CA"
+    );
     srv.shutdown().await;
     Ok(())
 }
@@ -224,7 +227,12 @@ async fn typed_echo_service_roundtrip() -> anyhow::Result<()> {
     let srv = start_server(echo_dispatch)?;
     let (_ep, client) = connect(&srv).await?;
     let resp = EchoClient::new(client)
-        .echo(EchoRequest { text: "hello".into() }, None)
+        .echo(
+            EchoRequest {
+                text: "hello".into(),
+            },
+            None,
+        )
         .await?;
     assert_eq!(resp.text, "hello");
     srv.shutdown().await;
@@ -287,7 +295,10 @@ fn frame_rejects_bad_version_kind_and_size() {
 
     let mut bad_kind = wire.clone();
     bad_kind[1] = 9;
-    assert!(matches!(codec.decode(&mut bad_kind), Err(FrameError::BadKind(9))));
+    assert!(matches!(
+        codec.decode(&mut bad_kind),
+        Err(FrameError::BadKind(9))
+    ));
 
     let mut too_large = BytesMut::new();
     too_large.put_u8(VERSION);
@@ -310,6 +321,61 @@ async fn raw_connection(srv: &TestServer) -> anyhow::Result<(Endpoint, quinn::Co
     ep.set_default_client_config(srv.ca.client_config(srv.ca.issue("client-raw")?)?);
     let conn = ep.connect(srv.addr, "server.rpc")?.await?;
     Ok((ep, conn))
+}
+
+#[tokio::test]
+async fn client_rejects_a_reply_with_the_wrong_call_id() -> anyhow::Result<()> {
+    init();
+    let ca = DevCA::new()?;
+    let ep = Endpoint::server(
+        ca.server_config(ca.issue("server.rpc")?)?,
+        "127.0.0.1:0".parse()?,
+    )?;
+    let addr = ep.local_addr()?;
+
+    // Fake server: answers the first stream with a reply for call id 999.
+    let fake = tokio::spawn(async move {
+        let conn = ep
+            .accept()
+            .await
+            .expect("no connection")
+            .await
+            .expect("handshake failed");
+        let (mut send, _recv) = conn.accept_bi().await.expect("no stream");
+        let mut wire = BytesMut::new();
+        let mut codec = FrameCodec;
+        codec
+            .encode(
+                Frame {
+                    kind: Kind::Response,
+                    flags: END_STREAM,
+                    call_id: 999,
+                    payload: Bytes::from_static(b"forged"),
+                },
+                &mut wire,
+            )
+            .expect("encode failed");
+        send.write_all(&wire).await.expect("write failed");
+        send.finish().expect("finish failed");
+        let _ = send.stopped().await;
+    });
+
+    let mut client_ep = Endpoint::client("127.0.0.1:0".parse()?)?;
+    client_ep.set_default_client_config(ca.client_config(ca.issue("client-1")?)?);
+    let client = Client::new(client_ep.connect(addr, "server.rpc")?.await?);
+
+    let err = client
+        .call(b"hello", Some(Duration::from_secs(2)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Code::Internal);
+    assert!(
+        err.message.contains("call id 999"),
+        "unexpected error: {}",
+        err.message
+    );
+    fake.await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -337,10 +403,20 @@ async fn garbage_streams_do_not_break_the_server() -> anyhow::Result<()> {
     let srv = start_server(raw_echo)?;
     let (_raw_ep, raw) = raw_connection(&srv).await?;
 
-    // Stream 1: bytes that are not a frame at all.
-    let (mut send, _recv) = raw.open_bi().await?;
+    // Stream 1: bytes that are not a frame at all. The server must answer with
+    // an InvalidArgument error rather than stay silent.
+    let (mut send, recv) = raw.open_bi().await?;
     send.write_all(&[0xFFu8; 64]).await?;
     send.finish()?;
+    let reply = FramedRead::new(recv, FrameCodec)
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no reply to a malformed request"))??;
+    assert_eq!(reply.kind, Kind::Error);
+    assert_eq!(
+        &reply.payload[..2],
+        &(Code::InvalidArgument as u16).to_be_bytes()[..]
+    );
 
     // Stream 2: a valid-looking header with an unknown frame kind (9).
     let (mut send2, _recv2) = raw.open_bi().await?;
@@ -474,7 +550,10 @@ async fn client_gets_an_error_when_server_disappears_mid_call() -> anyhow::Resul
         .await
         .expect("client hung after the server closed")
         .expect("call task panicked");
-    assert!(result.is_err(), "the call should fail when the server is gone");
+    assert!(
+        result.is_err(),
+        "the call should fail when the server is gone"
+    );
 
     srv.task.abort();
     Ok(())

@@ -174,7 +174,22 @@ where
     let mut rx = FramedRead::new(recv, FrameCodec);
     let req = match rx.next().await {
         Some(Ok(f)) if f.kind == Kind::Request => f,
-        _ => return Ok(()), // malformed or empty stream: nothing to answer
+        // Not a request: answer with an error instead of going silent, so the
+        // peer never waits for a reply that will not come.
+        Some(Ok(f)) => {
+            let msg = format!("expected a request frame, got {:?}", f.kind);
+            return respond(
+                &mut send,
+                f.call_id,
+                Err(RpcError::new(Code::InvalidArgument, msg)),
+            )
+            .await;
+        }
+        Some(Err(e)) => {
+            let msg = format!("malformed frame: {e}");
+            return respond(&mut send, 0, Err(RpcError::new(Code::InvalidArgument, msg))).await;
+        }
+        None => return Ok(()), // the peer closed the stream without sending anything
     };
     let call_id = req.call_id;
 
@@ -341,6 +356,14 @@ impl Client {
             .ok_or_else(|| unavailable("stream closed before response"))?
             .map_err(internal)?;
         call.finished = true;
+
+        // Each call has its own stream, so the reply must carry this call's id.
+        if resp.call_id != call_id {
+            return Err(internal(format!(
+                "reply carries call id {} but this call is {}",
+                resp.call_id, call_id
+            )));
+        }
 
         // switch from sending to receiving
         // Receiving the RPC response
