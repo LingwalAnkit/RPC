@@ -1,3 +1,4 @@
+mod codec;
 mod frame;
 mod rpc;
 mod tls;
