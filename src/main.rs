@@ -1,10 +1,14 @@
+#[cfg(test)]
+mod bench_tests;
 mod codec;
 mod echo_service;
 mod frame;
+#[cfg(test)]
+mod property_tests;
 mod rpc;
+mod tls;
 #[cfg(test)]
 mod transport_tests;
-mod tls;
 
 use std::{net::SocketAddr, time::Duration};
 
@@ -44,7 +48,10 @@ async fn main() -> anyhow::Result<()> {
         "echo returned {:?}, expected \"hi\"",
         reply.text
     );
-    println!("echo over QUIC + mTLS: sent \"hi\", received {:?}: OK", reply.text);
+    println!(
+        "echo over QUIC + mTLS: sent \"hi\", received {:?}: OK",
+        reply.text
+    );
     Ok(())
 }
 
@@ -55,9 +62,7 @@ async fn echo_once(ca: &tls::DevCA, addr: SocketAddr) -> anyhow::Result<EchoResp
 
     let reply = EchoClient::new(client)
         .echo(
-            EchoRequest {
-                text: "hi".into(),
-            },
+            EchoRequest { text: "hi".into() },
             Some(Duration::from_secs(2)),
         )
         .await?;
