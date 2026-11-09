@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use quinn::Endpoint;
 use tokio::task::JoinHandle;
 use tokio_util::{
@@ -22,9 +22,9 @@ use tokio_util::{
 
 use crate::{
     codec::{EchoRequest, Message},
-    echo_service::{ECHO_METHOD, EchoClient, EchoResponse},
-    frame::{Frame, FrameCodec, FrameError, Kind, MAX_PAYLOAD, END_STREAM, VERSION},
-    rpc::{Client, Code, RpcError, echo, serve},
+    echo_service::{EchoClient, dispatch as echo_dispatch},
+    frame::{END_STREAM, Frame, FrameCodec, FrameError, Kind, MAX_PAYLOAD, VERSION},
+    rpc::{Client, Code, RpcError, serve},
     tls::DevCA,
 };
 
@@ -36,6 +36,18 @@ fn init() {
             .install_default()
             .ok();
     });
+}
+
+/// Raw test handler: echoes the body. "sleep:<ms>" sleeps first, for deadline tests.
+async fn raw_echo(body: Bytes) -> Result<Bytes, RpcError> {
+    if let Some(ms) = body.strip_prefix(b"sleep:") {
+        let ms: u64 = std::str::from_utf8(ms)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| RpcError::new(Code::InvalidArgument, "bad sleep"))?;
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+    Ok(body)
 }
 
 struct TestServer {
@@ -86,27 +98,11 @@ async fn connect(srv: &TestServer) -> anyhow::Result<(Endpoint, Client)> {
     Ok((ep, Client::new(conn)))
 }
 
-/// Dispatches the typed echo protocol: a u16 method id, then an EchoRequest.
-async fn echo_dispatch(mut body: Bytes) -> Result<Bytes, RpcError> {
-    if body.len() < 2 {
-        return Err(RpcError::new(Code::InvalidArgument, "missing method id"));
-    }
-    let method = body.get_u16();
-    if method != ECHO_METHOD {
-        return Err(RpcError::new(Code::NotFound, "unknown method"));
-    }
-    let req = EchoRequest::decode(&mut body)
-        .map_err(|e| RpcError::new(Code::InvalidArgument, e.to_string()))?;
-    let mut out = BytesMut::new();
-    EchoResponse { text: req.text }.encode(&mut out);
-    Ok(out.freeze())
-}
-
 // ---------- calls ----------
 
 #[tokio::test]
 async fn echo_roundtrip() -> anyhow::Result<()> {
-    let srv = start_server(echo)?;
+    let srv = start_server(raw_echo)?;
     let (_ep, client) = connect(&srv).await?;
     let out = client.call(b"hello", None).await?;
     assert_eq!(&out[..], b"hello");
@@ -117,7 +113,7 @@ async fn echo_roundtrip() -> anyhow::Result<()> {
 #[tokio::test]
 async fn large_payload_roundtrips() -> anyhow::Result<()> {
     let body: Vec<u8> = (0..(1usize << 20)).map(|i| (i % 251) as u8).collect();
-    let srv = start_server(echo)?;
+    let srv = start_server(raw_echo)?;
     let (_ep, client) = connect(&srv).await?;
     let out = client.call(&body, None).await?;
     assert_eq!(out.len(), body.len());
@@ -141,7 +137,7 @@ async fn handler_error_reaches_client_with_code_and_message() -> anyhow::Result<
 
 #[tokio::test]
 async fn client_deadline_is_enforced() -> anyhow::Result<()> {
-    let srv = start_server(echo)?;
+    let srv = start_server(raw_echo)?;
     let (_ep, client) = connect(&srv).await?;
     let err = client
         .call(b"sleep:2000", Some(Duration::from_millis(100)))
@@ -199,7 +195,7 @@ async fn cancelled_call_stops_server_handler() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn client_with_untrusted_certificate_is_rejected() -> anyhow::Result<()> {
-    let srv = start_server(echo)?;
+    let srv = start_server(raw_echo)?;
     let intruder_ca = DevCA::new()?;
     let mut ep = Endpoint::client("127.0.0.1:0".parse()?)?;
     // Trusts the server's CA, so the server certificate checks out, but presents
