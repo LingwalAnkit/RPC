@@ -61,11 +61,15 @@ cargo test --release bench_loopback -- --ignored --nocapture
 
 | Run | Calls/s | Mean | p50 | p99 |
 |---|---|---|---|---|
-| 1 | 15,875 | 63 µs | 57 µs | 171 µs |
-| 2 | 15,391 | 65 µs | 59 µs | 180 µs |
-| 3 | 16,475 | 61 µs | 55 µs | 156 µs |
+| 1 | 14,786 | 68 µs | 59 µs | 223 µs |
+| 2 | 14,049 | 71 µs | 62 µs | 243 µs |
+| 3 | 15,698 | 64 µs | 56 µs | 205 µs |
 
-Median of three: **about 15,900 calls/s, p99 171 µs**.
+Median of three: **about 14,800 calls/s, p99 223 µs**.
+
+An earlier set of three runs on the same machine, before the baseline tag, gave
+15,391 to 16,475 calls/s and p99 156 to 180 µs. The spread between sets is run-to-run
+variation on this machine, so treat the numbers as a range, not a single figure.
 
 Machine: Intel Core i5-12450H (8 cores, 12 threads), 16 GB RAM, Windows 11.
 
