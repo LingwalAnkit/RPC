@@ -88,7 +88,19 @@ connections.
 | `src/echo_service.rs` | Typed echo protocol: server dispatcher and client |
 | `src/main.rs` | Demo: one echo call over QUIC with mutual TLS |
 
-## Next
+## Roadmap
 
-Leader election and log replication with Raft, then Byzantine fault tolerance.
-This work is not started in this branch.
+Status: the transport is built and tested. Consensus is not started.
+
+| Step | Goal | Done when | Status |
+|---|---|---|---|
+| 1. Raft leader election | Three nodes over QUIC elect one leader and elect a new one when it fails | At most one leader per term in every test; a new leader within a few seconds of a kill | Not started |
+| 2. Raft log replication | The leader replicates commands; an entry commits once a majority holds it; followers catch up | A committed entry survives a leader change; a lagging follower catches up | Not started |
+| 3. Crash-fault tests | Leader kill, follower kill, restart, and a partition that isolates the leader | All cases pass on repeated runs | Not started |
+| 4. BFT agreement | Three-phase agreement (PBFT style) with 3f+1 replicas and signed messages | Agreement holds with f faulty replicas in tests | Planned |
+| 5. View change | Replace a faulty leader without losing agreed entries | A faulty leader is replaced and agreed entries survive | Planned |
+| 6. Byzantine tests | Conflicting proposals and wrong votes from faulty replicas | Safety holds with up to f faulty replicas | Planned |
+
+Steps 1 to 3 handle crash faults only. Steps 4 to 6 add Byzantine faults.
+Effort estimates: about 3 to 4 weeks for steps 1 to 3, and longer for steps 4 to 6.
+These are planning estimates, not commitments.
