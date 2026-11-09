@@ -13,10 +13,11 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::{StreamExt, future::join_all};
 use quinn::Endpoint;
-use tokio::task::JoinHandle;
+use tokio::{sync::Notify, task::JoinHandle};
 use tokio_util::{
-    codec::{Decoder, Encoder},
+    codec::{Decoder, Encoder, FramedRead},
     sync::CancellationToken,
 };
 
@@ -298,4 +299,183 @@ fn frame_rejects_bad_version_kind_and_size() {
         codec.decode(&mut too_large),
         Err(FrameError::TooLarge(_))
     ));
+}
+
+// ---------- edge cases ----------
+
+/// A plain QUIC connection that bypasses the RPC client, so tests can send
+/// bytes the client would never produce. Returns the endpoint to keep it alive.
+async fn raw_connection(srv: &TestServer) -> anyhow::Result<(Endpoint, quinn::Connection)> {
+    let mut ep = Endpoint::client("127.0.0.1:0".parse()?)?;
+    ep.set_default_client_config(srv.ca.client_config(srv.ca.issue("client-raw")?)?);
+    let conn = ep.connect(srv.addr, "server.rpc")?.await?;
+    Ok((ep, conn))
+}
+
+#[tokio::test]
+async fn many_concurrent_calls_on_one_connection() -> anyhow::Result<()> {
+    let srv = start_server(raw_echo)?;
+    let (_ep, client) = connect(&srv).await?;
+    let calls = (0..50).map(|i| {
+        let client = client.clone();
+        async move {
+            let body = format!("message-{i}");
+            let out = client.call(body.as_bytes(), None).await?;
+            anyhow::ensure!(&out[..] == body.as_bytes(), "call {i} got the wrong reply");
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+    for result in join_all(calls).await {
+        result?;
+    }
+    srv.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn garbage_streams_do_not_break_the_server() -> anyhow::Result<()> {
+    let srv = start_server(raw_echo)?;
+    let (_raw_ep, raw) = raw_connection(&srv).await?;
+
+    // Stream 1: bytes that are not a frame at all.
+    let (mut send, _recv) = raw.open_bi().await?;
+    send.write_all(&[0xFFu8; 64]).await?;
+    send.finish()?;
+
+    // Stream 2: a valid-looking header with an unknown frame kind (9).
+    let (mut send2, _recv2) = raw.open_bi().await?;
+    send2
+        .write_all(&[VERSION, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])
+        .await?;
+    send2.finish()?;
+
+    // The server must still answer a normal client.
+    let (_ep, client) = connect(&srv).await?;
+    let out = client.call(b"still alive", None).await?;
+    assert_eq!(&out[..], b"still alive");
+    srv.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn panicking_handler_fails_only_that_call() -> anyhow::Result<()> {
+    let srv = start_server(|body: Bytes| async move {
+        if &body[..] == b"boom" {
+            panic!("handler panicked on purpose");
+        }
+        Ok::<Bytes, RpcError>(body)
+    })?;
+    let (_ep, client) = connect(&srv).await?;
+    assert!(
+        client.call(b"boom", None).await.is_err(),
+        "the panicking call should fail"
+    );
+    let out = client.call(b"ok", None).await?;
+    assert_eq!(&out[..], b"ok");
+    srv.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_enforces_deadline_from_the_request_frame() -> anyhow::Result<()> {
+    let srv = start_server(raw_echo)?;
+    let (_raw_ep, raw) = raw_connection(&srv).await?;
+
+    // Request with a 100 ms deadline. The handler would sleep for 2 s.
+    let mut payload = BytesMut::new();
+    payload.put_u32(100);
+    payload.extend_from_slice(b"sleep:2000");
+    let mut wire = BytesMut::new();
+    let mut codec = FrameCodec;
+    codec.encode(
+        Frame {
+            kind: Kind::Request,
+            flags: END_STREAM,
+            call_id: 1,
+            payload: payload.freeze(),
+        },
+        &mut wire,
+    )?;
+
+    let (mut send, recv) = raw.open_bi().await?;
+    send.write_all(&wire).await?;
+    send.finish()?;
+
+    let started = std::time::Instant::now();
+    let mut frames = FramedRead::new(recv, FrameCodec);
+    let reply = tokio::time::timeout(Duration::from_secs(3), frames.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no reply from server"))??;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "server waited for the handler instead of enforcing the deadline"
+    );
+    assert_eq!(reply.kind, Kind::Error);
+    assert_eq!(
+        &reply.payload[..2],
+        &(Code::DeadlineExceeded as u16).to_be_bytes()[..]
+    );
+    srv.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_lets_an_in_flight_call_finish() -> anyhow::Result<()> {
+    let started = Arc::new(Notify::new());
+    let signal = started.clone();
+    let srv = start_server(move |body: Bytes| {
+        let signal = signal.clone();
+        async move {
+            signal.notify_one();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok::<Bytes, RpcError>(body)
+        }
+    })?;
+    let (_ep, client) = connect(&srv).await?;
+    let call = tokio::spawn(async move { client.call(b"finish-me", None).await });
+
+    // Wait until the handler is running, then shut down while it is still working.
+    started.notified().await;
+    srv.shutdown().await;
+
+    let reply = call.await??;
+    assert_eq!(&reply[..], b"finish-me");
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_gets_an_error_when_server_disappears_mid_call() -> anyhow::Result<()> {
+    init();
+    let ca = DevCA::new()?;
+    let server_ep = Endpoint::server(
+        ca.server_config(ca.issue("server.rpc")?)?,
+        "127.0.0.1:0".parse()?,
+    )?;
+    let addr = server_ep.local_addr()?;
+    // A second handle to the same endpoint lets the test kill the server abruptly.
+    let killer = server_ep.clone();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(serve(server_ep, raw_echo, stop.clone()));
+    let srv = TestServer {
+        addr,
+        ca,
+        stop,
+        task,
+    };
+
+    let (_ep, client) = connect(&srv).await?;
+    // No client timeout: without the fix this call would hang forever.
+    let call = tokio::spawn(async move { client.call(b"sleep:10000", None).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    killer.close(0u32.into(), b"server gone");
+    let result = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("client hung after the server closed")
+        .expect("call task panicked");
+    assert!(result.is_err(), "the call should fail when the server is gone");
+
+    srv.task.abort();
+    Ok(())
 }
