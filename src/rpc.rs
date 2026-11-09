@@ -103,18 +103,6 @@ fn decode_request(mut p: Bytes) -> Result<(u32, Bytes), RpcError> {
 
 // It reads the first four bytes as the deadline, leaving the remaining bytes as the body.
 
-/// Demo handler: echoes the body. "sleep:<ms>" sleeps first (for testing deadlines).
-pub async fn echo(body: Bytes) -> Result<Bytes, RpcError> {
-    if let Some(ms) = body.strip_prefix(b"sleep:") {
-        let ms: u64 = std::str::from_utf8(ms)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| RpcError::new(Code::InvalidArgument, "bad sleep"))?;
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-    }
-    Ok(body)
-}
-
 // ---------- server ----------
 
 pub async fn serve<H, Fut>(ep: Endpoint, handler: H, shutdown: CancellationToken)

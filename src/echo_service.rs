@@ -1,4 +1,4 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::time::Duration;
 
 use crate::codec::{DecodeError, EchoRequest, Message, get_str, put_str};
@@ -24,6 +24,21 @@ impl Message for EchoResponse {
 
 fn bad_request(e: DecodeError) -> RpcError {
     RpcError::new(Code::InvalidArgument, e.to_string())
+}
+
+/// Server-side dispatcher for the echo protocol: a u16 method id, then an EchoRequest.
+pub async fn dispatch(mut body: Bytes) -> Result<Bytes, RpcError> {
+    if body.len() < 2 {
+        return Err(RpcError::new(Code::InvalidArgument, "missing method id"));
+    }
+    let method = body.get_u16();
+    if method != ECHO_METHOD {
+        return Err(RpcError::new(Code::NotFound, "unknown method"));
+    }
+    let req = EchoRequest::decode(&mut body).map_err(bad_request)?;
+    let mut out = BytesMut::new();
+    EchoResponse { text: req.text }.encode(&mut out);
+    Ok(out.freeze())
 }
 
 #[derive(Clone)]

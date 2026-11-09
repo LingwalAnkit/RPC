@@ -6,10 +6,10 @@ mod rpc;
 mod transport_tests;
 mod tls;
 
-use std::time::Duration;
-
+use codec::EchoRequest;
+use echo_service::{EchoClient, dispatch};
 use quinn::Endpoint; // Endpoint comes from the Quinn library, which implements QUIC in Rust.
-use rpc::{Client, echo, serve};
+use rpc::{Client, serve};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     // creates a cancellation token
     // think of this a shared signal starts with not cancelled state
 
-    let server = tokio::spawn(serve(sep, echo, shutdown.clone()));
+    let server = tokio::spawn(serve(sep, dispatch, shutdown.clone()));
     //Tokio's spawn schedules an asynchronous task to run independently of the current task.
 
     let mut cep = Endpoint::client("0.0.0.0:0".parse()?)?;
@@ -46,12 +46,10 @@ async fn main() -> anyhow::Result<()> {
     // addr Tells the client where to send network traffic.
     // Identifies the expected server name during TLS authentication.
 
-    println!("{:?}", client.call(b"hi", None).await);
-    // b means byte string
     println!(
         "{:?}",
-        client
-            .call(b"sleep:2000", Some(Duration::from_millis(100)))
+        EchoClient::new(client.clone())
+            .echo(EchoRequest { text: "hi".into() }, None)
             .await
     );
 
