@@ -1,6 +1,9 @@
 mod codec;
+mod echo_service;
 mod frame;
 mod rpc;
+#[cfg(test)]
+mod transport_tests;
 mod tls;
 
 use std::time::Duration;
