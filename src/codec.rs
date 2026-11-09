@@ -41,10 +41,6 @@ fn need(input: &Bytes, n: usize) -> Result<(), DecodeError> {
     Ok(())
 }
 
-pub fn put_u32(out: &mut BytesMut, v: u32) {
-    out.put_u32(v); // converts the integer into 4 bytes and appends them to the buffer.
-}
-
 pub fn get_u32(input: &mut Bytes) -> Result<u32, DecodeError> {
     need(input, 4)?; // read the buffer
     Ok(input.get_u32())

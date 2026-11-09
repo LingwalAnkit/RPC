@@ -86,7 +86,7 @@ impl DevCA {
         // this create a trust store
         // arc let multiple part of program share ownership of same value safley
         let mut roots = RootCertStore::empty();
-        roots.add(self.cert.der().clone());
+        roots.add(self.cert.der().clone())?;
         // add ca certificate here
         // this means trust certificate signed by ca
         Ok(Arc::new(roots))
