@@ -6,12 +6,16 @@ mod rpc;
 mod transport_tests;
 mod tls;
 
+use std::{net::SocketAddr, time::Duration};
+
 use codec::EchoRequest;
-use echo_service::{EchoClient, dispatch};
-use quinn::Endpoint; // Endpoint comes from the Quinn library, which implements QUIC in Rust.
+use echo_service::{EchoClient, EchoResponse, dispatch};
+use quinn::Endpoint;
 use rpc::{Client, serve};
 use tokio_util::sync::CancellationToken;
 
+/// Demo: one typed echo call over QUIC with mutual TLS, on loopback.
+/// Exits with an error unless the server echoes the text back unchanged.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider()
@@ -19,43 +23,43 @@ async fn main() -> anyhow::Result<()> {
         .ok();
 
     let ca = tls::DevCA::new()?;
-    // creates a certificate authority
 
-    let sep = Endpoint::server(
+    let server_ep = Endpoint::server(
         ca.server_config(ca.issue("server.rpc")?)?,
         "127.0.0.1:0".parse()?,
     )?;
-    // creating server endpoint
-    // server(server_config , server address)
-
-    let addr = sep.local_addr()?;
-    // .local_addr() retrieves its actual local socket address.
-    // 127.0.0.1:54321 the address might be this 0 is just a placeholder
+    let addr = server_ep.local_addr()?;
 
     let shutdown = CancellationToken::new();
-    // creates a cancellation token
-    // think of this a shared signal starts with not cancelled state
+    let server = tokio::spawn(serve(server_ep, dispatch, shutdown.clone()));
 
-    let server = tokio::spawn(serve(sep, dispatch, shutdown.clone()));
-    //Tokio's spawn schedules an asynchronous task to run independently of the current task.
-
-    let mut cep = Endpoint::client("0.0.0.0:0".parse()?)?;
-    cep.set_default_client_config(ca.client_config(ca.issue("client-1")?)?);
-    //Configure outgoing connections
-    let client = Client::new(cep.connect(addr, "server.rpc")?.await?);
-    // addr Tells the client where to send network traffic.
-    // Identifies the expected server name during TLS authentication.
-
-    println!(
-        "{:?}",
-        EchoClient::new(client.clone())
-            .echo(EchoRequest { text: "hi".into() }, None)
-            .await
-    );
-
+    // Stop the server even if the call fails, so the program always exits cleanly.
+    let result = echo_once(&ca, addr).await;
     shutdown.cancel();
     server.await?;
+
+    let reply = result?;
+    anyhow::ensure!(
+        reply.text == "hi",
+        "echo returned {:?}, expected \"hi\"",
+        reply.text
+    );
+    println!("echo over QUIC + mTLS: sent \"hi\", received {:?}: OK", reply.text);
     Ok(())
 }
 
-// ?  at any point of the code if error occur stop the code and throw error
+async fn echo_once(ca: &tls::DevCA, addr: SocketAddr) -> anyhow::Result<EchoResponse> {
+    let mut client_ep = Endpoint::client("127.0.0.1:0".parse()?)?;
+    client_ep.set_default_client_config(ca.client_config(ca.issue("client-1")?)?);
+    let client = Client::new(client_ep.connect(addr, "server.rpc")?.await?);
+
+    let reply = EchoClient::new(client)
+        .echo(
+            EchoRequest {
+                text: "hi".into(),
+            },
+            Some(Duration::from_secs(2)),
+        )
+        .await?;
+    Ok(reply)
+}
